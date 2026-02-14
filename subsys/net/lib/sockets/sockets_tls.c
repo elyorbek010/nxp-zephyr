@@ -958,6 +958,163 @@ static bool crt_is_pem(const unsigned char *buf, size_t buflen)
 	return (buflen != 0 && buf[buflen - 1] == '\0' &&
 		strstr((const char *)buf, "-----BEGIN CERTIFICATE-----") != NULL);
 }
+
+static bool tls_ca_bundle_line_is_separator(const char *line, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		if (line[i] != '=') {
+			return false;
+		}
+	}
+
+	return len > 0;
+}
+
+static void tls_ca_bundle_get_cert_name(const char *bundle_start, const char *cert_begin,
+					char *name, size_t name_len)
+{
+	const char *line_end = cert_begin;
+	size_t attempts = 0;
+
+	if ((name == NULL) || (name_len == 0)) {
+		return;
+	}
+
+	name[0] = '\0';
+
+	while ((line_end > bundle_start) &&
+	       ((line_end[-1] == '\n') || (line_end[-1] == '\r'))) {
+		line_end--;
+	}
+
+	while ((line_end > bundle_start) && (attempts < 8)) {
+		const char *line_start = line_end;
+		const char *trim_start;
+		const char *trim_end;
+		size_t line_len;
+		size_t copy_len;
+
+		while ((line_start > bundle_start) &&
+		       (line_start[-1] != '\n') && (line_start[-1] != '\r')) {
+			line_start--;
+		}
+
+		trim_start = line_start;
+		trim_end = line_end;
+
+		while ((trim_start < trim_end) &&
+		       ((*trim_start == ' ') || (*trim_start == '\t'))) {
+			trim_start++;
+		}
+
+		while ((trim_end > trim_start) &&
+		       ((trim_end[-1] == ' ') || (trim_end[-1] == '\t'))) {
+			trim_end--;
+		}
+
+		line_len = (size_t)(trim_end - trim_start);
+		if ((line_len > 0) &&
+		    !tls_ca_bundle_line_is_separator(trim_start, line_len) &&
+		    !((line_len >= 10) && (strncmp(trim_start, "-----BEGIN", 10) == 0)) &&
+		    (trim_start[0] != '#')) {
+			copy_len = MIN(line_len, name_len - 1);
+			memcpy(name, trim_start, copy_len);
+			name[copy_len] = '\0';
+			return;
+		}
+
+		line_end = line_start;
+		while ((line_end > bundle_start) &&
+		       ((line_end[-1] == '\n') || (line_end[-1] == '\r'))) {
+			line_end--;
+		}
+
+		attempts++;
+	}
+}
+
+static void tls_log_failed_ca_bundle_entries(const unsigned char *buf, size_t buflen)
+{
+	static const char begin_mark[] = "-----BEGIN CERTIFICATE-----";
+	static const char end_mark[] = "-----END CERTIFICATE-----";
+	const char *scan = (const char *)buf;
+	const char *limit = (const char *)buf + buflen;
+	int cert_idx = 0;
+	int failed = 0;
+
+	while (scan < limit) {
+		const char *begin = strstr(scan, begin_mark);
+		const char *end;
+		const char *next;
+		size_t cert_len;
+		unsigned char *cert_buf;
+		mbedtls_x509_crt cert;
+		char cert_name[96];
+		char subject[160];
+		int ret;
+		int subject_len;
+
+		if ((begin == NULL) || (begin >= limit)) {
+			break;
+		}
+
+		end = strstr(begin, end_mark);
+		if ((end == NULL) || (end >= limit)) {
+			break;
+		}
+
+		next = end + (sizeof(end_mark) - 1);
+		while ((next < limit) && ((*next == '\r') || (*next == '\n'))) {
+			next++;
+		}
+
+		cert_len = (size_t)(next - begin);
+		cert_idx++;
+
+		cert_buf = k_malloc(cert_len + 1);
+		if (cert_buf == NULL) {
+			NET_WARN("CA diagnostics: OOM while parsing bundle cert #%d", cert_idx);
+			break;
+		}
+
+		memcpy(cert_buf, begin, cert_len);
+		cert_buf[cert_len] = '\0';
+		tls_ca_bundle_get_cert_name((const char *)buf, begin, cert_name,
+					    sizeof(cert_name));
+
+		mbedtls_x509_crt_init(&cert);
+		ret = mbedtls_x509_crt_parse(&cert, cert_buf, cert_len + 1);
+		if (ret < 0) {
+			subject_len = mbedtls_x509_dn_gets(subject, sizeof(subject), &cert.subject);
+			if ((subject_len > 0) && (cert_name[0] != '\0')) {
+				NET_WARN("CA diagnostics: cert #%d (\"%s\") parse failed: -0x%x, "
+					 "subject=\"%s\"",
+					 cert_idx, cert_name, -ret, subject);
+			} else if (subject_len > 0) {
+				NET_WARN("CA diagnostics: cert #%d parse failed: -0x%x, subject=\"%s\"",
+					 cert_idx, -ret, subject);
+			} else if (cert_name[0] != '\0') {
+				NET_WARN("CA diagnostics: cert #%d (\"%s\") parse failed: -0x%x, "
+					 "subject=<unknown>",
+					 cert_idx, cert_name, -ret);
+			} else {
+				NET_WARN("CA diagnostics: cert #%d parse failed: -0x%x, subject=<unknown>",
+					 cert_idx, -ret);
+			}
+			failed++;
+		}
+		mbedtls_x509_crt_free(&cert);
+		k_free(cert_buf);
+
+		scan = next;
+	}
+
+	if (failed > 0) {
+		NET_WARN("CA diagnostics: failed certs in bundle: %d", failed);
+	}
+}
 #endif
 
 static int tls_add_ca_certificate(struct tls_context *tls,
@@ -965,9 +1122,9 @@ static int tls_add_ca_certificate(struct tls_context *tls,
 {
 #if defined(MBEDTLS_X509_CRT_PARSE_C)
 	int err;
+	const bool is_pem = crt_is_pem(ca_cert->buf, ca_cert->len);
 
-	if (tls->options.cert_nocopy == TLS_CERT_NOCOPY_NONE ||
-	    crt_is_pem(ca_cert->buf, ca_cert->len)) {
+	if (tls->options.cert_nocopy == TLS_CERT_NOCOPY_NONE || is_pem) {
 		err = mbedtls_x509_crt_parse(&tls->ca_chain, ca_cert->buf,
 					     ca_cert->len);
 	} else {
@@ -977,7 +1134,24 @@ static int tls_add_ca_certificate(struct tls_context *tls,
 	}
 
 	if (err != 0) {
-		NET_ERR("Failed to parse CA certificate, err: -0x%x", -err);
+		if (is_pem) {
+			if (err > 0) {
+				NET_WARN("CA diagnostics: bundle parse skipped %d cert(s), dumping failures",
+					 err);
+			} else {
+				NET_WARN("CA diagnostics: CA bundle parse returned -0x%x, dumping failures",
+					 -err);
+			}
+			tls_log_failed_ca_bundle_entries(ca_cert->buf, ca_cert->len);
+		}
+		if (err < 0) {
+			char reason[96];
+
+			mbedtls_strerror(err, reason, sizeof(reason));
+			NET_ERR("Failed to parse CA certificate, err: -0x%x (%s)", -err, reason);
+		} else {
+			NET_ERR("Failed to parse CA certificate bundle, skipped certs: %d", err);
+		}
 		return -EINVAL;
 	}
 
