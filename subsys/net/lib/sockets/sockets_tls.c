@@ -1320,6 +1320,37 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 		 */
 		return -ENOMEM;
 	}
+
+	/*
+	 * Enforce protocol version per socket type selected at socket() call.
+	 * Zephyr stores the requested secure protocol in context->tls_version,
+	 * but mbedTLS defaults allow a full compiled-in range unless clamped.
+	 */
+	switch (context->tls_version) {
+	case IPPROTO_TLS_1_2:
+#if defined(CONFIG_MBEDTLS_TLS_VERSION_1_2)
+		mbedtls_ssl_conf_min_tls_version(&context->config,
+						 MBEDTLS_SSL_VERSION_TLS1_2);
+		mbedtls_ssl_conf_max_tls_version(&context->config,
+						 MBEDTLS_SSL_VERSION_TLS1_2);
+#else
+		return -ENOTSUP;
+#endif
+		break;
+	case IPPROTO_TLS_1_3:
+#if defined(CONFIG_MBEDTLS_TLS_VERSION_1_3)
+		mbedtls_ssl_conf_min_tls_version(&context->config,
+						 MBEDTLS_SSL_VERSION_TLS1_3);
+		mbedtls_ssl_conf_max_tls_version(&context->config,
+						 MBEDTLS_SSL_VERSION_TLS1_3);
+#else
+		return -ENOTSUP;
+#endif
+		break;
+	default:
+		break;
+	}
+
 	tls_set_max_frag_len(&context->config, context->type);
 
 #if defined(MBEDTLS_SSL_RENEGOTIATION)
